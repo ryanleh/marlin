@@ -23,6 +23,8 @@ use ark_std::{
 };
 use rand_core::RngCore;
 
+use rayon::ThreadPoolBuilder;
+
 /// State for the AHP prover.
 pub struct ProverState<'a, F: PrimeField> {
     formatted_input_assignment: Vec<F>,
@@ -316,62 +318,94 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let v_H = domain_h.vanishing_polynomial().into();
 
-        let x_time = start_timer!(|| "Computing x polynomial and evals");
-        let domain_x = state.domain_x;
-        let x_poly = EvaluationsOnDomain::from_vec_and_domain(
-            state.formatted_input_assignment.clone(),
-            domain_x,
-        )
-        .interpolate();
-        let x_evals = domain_h.fft(&x_poly);
-        end_timer!(x_time);
+        let mut w_poly: Option<DensePolynomial<F>> = None;
+        let mut z_a_poly: Option<DensePolynomial<F>> = None;
+        let mut z_b_poly: Option<DensePolynomial<F>> = None;
+        let mut mask_poly: Option<DensePolynomial<F>> = None;
 
-        let ratio = domain_h.size() / domain_x.size();
+        let poly_time = start_timer!(|| "Computing polys");
 
-        let mut w_extended = state.witness_assignment.clone();
-        w_extended.extend(vec![
-            F::zero();
-            domain_h.size()
-                - domain_x.size()
-                - state.witness_assignment.len()
-        ]);
-
-        let w_poly_time = start_timer!(|| "Computing w polynomial");
-        let w_poly_evals = cfg_into_iter!(0..domain_h.size())
-            .map(|k| {
-                if k % ratio == 0 {
-                    F::zero()
-                } else {
-                    w_extended[k - (k / ratio) - 1] - &x_evals[k]
-                }
-            })
-            .collect();
-
-        let w_poly = &EvaluationsOnDomain::from_vec_and_domain(w_poly_evals, domain_h)
-            .interpolate()
-            + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
-        let (w_poly, remainder) = w_poly.divide_by_vanishing_poly(domain_x).unwrap();
-        assert!(remainder.is_zero());
-        end_timer!(w_poly_time);
-
-        let z_a_poly_time = start_timer!(|| "Computing z_A polynomial");
+        let domain_x = state.domain_x.clone(); // TODO: Try removing clone
+        let domain_h = state.domain_h.clone(); // TODO: Try removing clone
         let z_a = state.z_a.clone().unwrap();
-        let z_a_poly = &EvaluationsOnDomain::from_vec_and_domain(z_a, domain_h).interpolate()
-            + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
-        end_timer!(z_a_poly_time);
-
-        let z_b_poly_time = start_timer!(|| "Computing z_B polynomial");
         let z_b = state.z_b.clone().unwrap();
-        let z_b_poly = &EvaluationsOnDomain::from_vec_and_domain(z_b, domain_h).interpolate()
-            + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
-        end_timer!(z_b_poly_time);
+        let input_assignment = state.formatted_input_assignment.clone();
+        let witness_assignment = &state.witness_assignment;
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                let rng = &mut ark_ff::test_rng(); // TODO
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                w_poly = Some(pool.install(|| {
+                    let x_poly =
+                        EvaluationsOnDomain::from_vec_and_domain(input_assignment, domain_x)
+                            .interpolate();
+                    let x_evals = domain_h.fft(&x_poly);
 
-        let mask_poly_time = start_timer!(|| "Computing mask polynomial");
-        let mask_poly_degree = 3 * domain_h.size() + 2 * zk_bound - 3;
-        let mut mask_poly = DensePolynomial::rand(mask_poly_degree, rng);
-        let scaled_sigma_1 = (mask_poly.divide_by_vanishing_poly(domain_h).unwrap().1)[0];
-        mask_poly[0] -= &scaled_sigma_1;
-        end_timer!(mask_poly_time);
+                    let ratio = domain_h.size() / domain_x.size();
+
+                    let mut w_extended = witness_assignment.clone();
+                    w_extended.extend(vec![
+                        F::zero();
+                        domain_h.size()
+                            - domain_x.size()
+                            - witness_assignment.len()
+                    ]);
+
+                    let w_poly_evals = cfg_into_iter!(0..domain_h.size())
+                        .map(|k| {
+                            if k % ratio == 0 {
+                                F::zero()
+                            } else {
+                                w_extended[k - (k / ratio) - 1] - &x_evals[k]
+                            }
+                        })
+                        .collect();
+
+                    let w_poly = &EvaluationsOnDomain::from_vec_and_domain(w_poly_evals, domain_h)
+                        .interpolate()
+                        + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
+                    let (w_poly, remainder) = w_poly.divide_by_vanishing_poly(domain_x).unwrap();
+                    assert!(remainder.is_zero());
+                    w_poly
+                }));
+            });
+
+            s.spawn(|_| {
+                let rng = &mut ark_ff::test_rng(); // TODO
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                z_a_poly = Some(pool.install(|| {
+                    &EvaluationsOnDomain::from_vec_and_domain(z_a, domain_h).interpolate()
+                        + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H)
+                }));
+            });
+
+            s.spawn(|_| {
+                let rng = &mut ark_ff::test_rng(); // TODO
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                z_b_poly = Some(pool.install(|| {
+                    &EvaluationsOnDomain::from_vec_and_domain(z_b, domain_h).interpolate()
+                        + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H)
+                }));
+            });
+
+            s.spawn(|_| {
+                let rng = &mut ark_ff::test_rng(); // TODO
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                mask_poly = Some(pool.install(|| {
+                    let mask_poly_degree = 3 * domain_h.size() + 2 * zk_bound - 3;
+                    let mut mask_poly = DensePolynomial::rand(mask_poly_degree, rng);
+                    let scaled_sigma_1 =
+                        (mask_poly.divide_by_vanishing_poly(domain_h).unwrap().1)[0];
+                    mask_poly[0] -= &scaled_sigma_1;
+                    mask_poly
+                }));
+            });
+        });
+        let w_poly = w_poly.unwrap();
+        let z_a_poly = z_a_poly.unwrap();
+        let z_b_poly = z_b_poly.unwrap();
+        let mask_poly = mask_poly.unwrap();
+        end_timer!(poly_time);
 
         let msg = ProverMsg::EmptyMessage;
 
@@ -455,41 +489,69 @@ impl<F: PrimeField> AHPForR1CS<F> {
             eta_c,
         } = *ver_message;
 
-        let summed_z_m_poly_time = start_timer!(|| "Compute z_m poly");
+        let mut summed_z_m = None;
+        let mut r_alpha_poly = None;
+        let mut t_poly = None;
+        let poly_time = start_timer!(|| "Computing polys");
+
         let (z_a_poly, z_b_poly) = state.mz_polys.as_ref().unwrap();
-        let z_c_poly = z_a_poly.polynomial() * z_b_poly.polynomial();
+        let z_a_poly = z_a_poly.polynomial();
+        let z_b_poly = z_b_poly.polynomial();
+        let domain_x = state.domain_x.clone();
+        let domain_h = state.domain_h.clone();
+        let a = &state.index.a;
+        let b = &state.index.b;
+        let c = &state.index.c;
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                summed_z_m = Some(pool.install(|| {
+                    let z_c_poly = z_a_poly * z_b_poly;
 
-        let mut summed_z_m_coeffs = z_c_poly.coeffs;
-        // Note: Can't combine these two loops, because z_c_poly has 2x the degree
-        // of z_a_poly and z_b_poly, so the second loop gets truncated due to
-        // the `zip`s.
-        cfg_iter_mut!(summed_z_m_coeffs).for_each(|c| *c *= &eta_c);
-        cfg_iter_mut!(summed_z_m_coeffs)
-            .zip(&z_a_poly.polynomial().coeffs)
-            .zip(&z_b_poly.polynomial().coeffs)
-            .for_each(|((c, a), b)| *c += &(eta_a * a + &(eta_b * b)));
+                    let mut summed_z_m_coeffs = z_c_poly.coeffs;
+                    // Note: Can't combine these two loops, because z_c_poly has 2x the degree
+                    // of z_a_poly and z_b_poly, so the second loop gets truncated due to
+                    // the `zip`s.
+                    cfg_iter_mut!(summed_z_m_coeffs).for_each(|c| *c *= &eta_c);
+                    cfg_iter_mut!(summed_z_m_coeffs)
+                        .zip(&z_a_poly.coeffs)
+                        .zip(&z_b_poly.coeffs)
+                        .for_each(|((c, a), b)| *c += &(eta_a * a + &(eta_b * b)));
 
-        let summed_z_m = DensePolynomial::from_coefficients_vec(summed_z_m_coeffs);
-        end_timer!(summed_z_m_poly_time);
+                    DensePolynomial::from_coefficients_vec(summed_z_m_coeffs)
+                }));
+            });
 
-        let r_alpha_x_evals_time = start_timer!(|| "Compute r_alpha_x evals");
-        let r_alpha_x_evals =
-            domain_h.batch_eval_unnormalized_bivariate_lagrange_poly_with_diff_inputs(alpha);
-        end_timer!(r_alpha_x_evals_time);
+            let r_alpha_x_evals =
+                domain_h.batch_eval_unnormalized_bivariate_lagrange_poly_with_diff_inputs(alpha);
+            let r_alpha_x_evals_vec = r_alpha_x_evals.to_vec();
 
-        let r_alpha_poly_time = start_timer!(|| "Compute r_alpha_x poly");
-        let r_alpha_poly = DensePolynomial::from_coefficients_vec(domain_h.ifft(&r_alpha_x_evals));
-        end_timer!(r_alpha_poly_time);
+            let domain_h_clone = domain_h.clone();
+            let r_alpha_poly = &mut r_alpha_poly;
+            s.spawn(move |_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                *r_alpha_poly = Some(pool.install(|| {
+                    DensePolynomial::from_coefficients_vec(domain_h_clone.ifft(&r_alpha_x_evals))
+                }));
+            });
 
-        let t_poly_time = start_timer!(|| "Compute t poly");
-        let t_poly = Self::calculate_t(
-            vec![&state.index.a, &state.index.b, &state.index.c].into_iter(),
-            &[eta_a, eta_b, eta_c],
-            state.domain_x,
-            state.domain_h,
-            r_alpha_x_evals.to_vec(),
-        );
-        end_timer!(t_poly_time);
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                t_poly = Some(pool.install(|| {
+                    Self::calculate_t(
+                        vec![a, b, c].into_iter(),
+                        &[eta_a, eta_b, eta_c],
+                        domain_x,
+                        domain_h,
+                        r_alpha_x_evals_vec,
+                    )
+                }));
+            });
+        });
+        end_timer!(poly_time);
+        let summed_z_m = summed_z_m.unwrap();
+        let r_alpha_poly = r_alpha_poly.unwrap();
+        let t_poly = t_poly.unwrap();
 
         let z_poly_time = start_timer!(|| "Compute z poly");
 
@@ -522,10 +584,43 @@ impl<F: PrimeField> AHPForR1CS<F> {
         .unwrap();
         let mul_domain = GeneralEvaluationDomain::new(mul_domain_size)
             .expect("field is not smooth enough to construct domain");
-        let mut r_alpha_evals = r_alpha_poly.evaluate_over_domain_by_ref(mul_domain);
-        let summed_z_m_evals = summed_z_m.evaluate_over_domain_by_ref(mul_domain);
-        let z_poly_evals = z_poly.evaluate_over_domain_by_ref(mul_domain);
-        let t_poly_m_evals = t_poly.evaluate_over_domain_by_ref(mul_domain);
+
+        let mut r_alpha_evals = None;
+        let mut summed_z_m_evals = None;
+        let mut z_poly_evals = None;
+        let mut t_poly_m_evals = None;
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                r_alpha_evals =
+                    Some(pool.install(|| r_alpha_poly.evaluate_over_domain_by_ref(mul_domain)));
+            });
+
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                summed_z_m_evals =
+                    Some(pool.install(|| summed_z_m.evaluate_over_domain_by_ref(mul_domain)));
+            });
+
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                z_poly_evals =
+                    Some(pool.install(|| z_poly.evaluate_over_domain_by_ref(mul_domain)));
+            });
+
+            s.spawn(|_| {
+                let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+                t_poly_m_evals =
+                    Some(pool.install(|| t_poly.evaluate_over_domain_by_ref(mul_domain)));
+            });
+        });
+
+        let (mut r_alpha_evals, summed_z_m_evals, z_poly_evals, t_poly_m_evals) = (
+            r_alpha_evals.unwrap(),
+            summed_z_m_evals.unwrap(),
+            z_poly_evals.unwrap(),
+            t_poly_m_evals.unwrap(),
+        );
 
         cfg_iter_mut!(r_alpha_evals.evals)
             .zip(&summed_z_m_evals.evals)
@@ -666,33 +761,38 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .collect();
         end_timer!(denom_eval_time);
 
-        let a_evals_time = start_timer!(|| "Computing a evals on B");
+        let mut a_poly = None;
+        let mut b_poly = None;
+        let poly_time = start_timer!(|| "Computing a and b poly");
         let a_star_evals_on_B = &a_star.evals_on_B;
         let b_star_evals_on_B = &b_star.evals_on_B;
         let c_star_evals_on_B = &c_star.evals_on_B;
-        let a_poly_on_B = cfg_into_iter!(0..domain_b.size())
-            .map(|i| {
-                let t = eta_a * a_star_evals_on_B.val.evals[i] * b_denom[i] * c_denom[i]
-                    + eta_b * b_star_evals_on_B.val.evals[i] * a_denom[i] * c_denom[i]
-                    + eta_c * c_star_evals_on_B.val.evals[i] * a_denom[i] * b_denom[i];
-                v_H_at_beta * v_H_at_alpha * t
-            })
-            .collect();
-        end_timer!(a_evals_time);
-
-        let a_poly_time = start_timer!(|| "Computing a poly");
-        let a_poly = EvaluationsOnDomain::from_vec_and_domain(a_poly_on_B, domain_b).interpolate();
-        end_timer!(a_poly_time);
-
-        let b_evals_time = start_timer!(|| "Computing b evals on B");
-        let b_poly_on_B = cfg_into_iter!(0..domain_b.size())
-            .map(|i| a_denom[i] * b_denom[i] * c_denom[i])
-            .collect();
-        end_timer!(b_evals_time);
-
-        let b_poly_time = start_timer!(|| "Computing b poly");
-        let b_poly = EvaluationsOnDomain::from_vec_and_domain(b_poly_on_B, domain_b).interpolate();
-        end_timer!(b_poly_time);
+        let compute_a_poly = || {
+            let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+            a_poly = Some(pool.install(|| {
+                let a_poly_on_B = cfg_into_iter!(0..domain_b.size())
+                    .map(|i| {
+                        let t = eta_a * a_star_evals_on_B.val.evals[i] * b_denom[i] * c_denom[i]
+                            + eta_b * b_star_evals_on_B.val.evals[i] * a_denom[i] * c_denom[i]
+                            + eta_c * c_star_evals_on_B.val.evals[i] * a_denom[i] * b_denom[i];
+                        v_H_at_beta * v_H_at_alpha * t
+                    })
+                    .collect();
+                EvaluationsOnDomain::from_vec_and_domain(a_poly_on_B, domain_b).interpolate()
+            }));
+        };
+        let compute_b_poly = || {
+            let pool = ThreadPoolBuilder::new().num_threads(20).build().unwrap();
+            b_poly = Some(pool.install(|| {
+                let b_poly_on_B = cfg_into_iter!(0..domain_b.size())
+                    .map(|i| a_denom[i] * b_denom[i] * c_denom[i])
+                    .collect();
+                EvaluationsOnDomain::from_vec_and_domain(b_poly_on_B, domain_b).interpolate()
+            }))
+        };
+        rayon::join(compute_a_poly, compute_b_poly);
+        let (a_poly, b_poly) = (a_poly.unwrap(), b_poly.unwrap());
+        end_timer!(poly_time);
 
         let h_2_poly_time = start_timer!(|| "Computing sumcheck h poly");
         let h_2 = (&a_poly - &(&b_poly * &f))
