@@ -18,7 +18,7 @@ use ark_relations::{
 use ark_std::{ops::Mul, UniformRand};
 use blake2::Blake2s;
 
-const NUM_PROVE_REPEATITIONS: usize = 10;
+const NUM_PROVE_REPEATITIONS: usize = 3;
 const NUM_VERIFY_REPEATITIONS: usize = 50;
 
 #[derive(Copy)]
@@ -66,20 +66,22 @@ impl<F: PrimeField> ConstraintSynthesizer<F> for DummyCircuit<F> {
 }
 
 macro_rules! marlin_prove_bench {
-    ($bench_name:ident, $bench_field:ty, $bench_pairing_engine:ty) => {
+    ($bench_name:ident, $bench_field:ty, $bench_pairing_engine:ty, $power:expr) => {
+        let constraints = 2usize.pow($power);
+
         let rng = &mut ark_std::test_rng();
         let c = DummyCircuit::<$bench_field> {
             a: Some(<$bench_field>::rand(rng)),
             b: Some(<$bench_field>::rand(rng)),
             num_variables: 10,
-            num_constraints: 65536,
+            num_constraints: constraints,
         };
 
         let srs = Marlin::<
             $bench_field,
             MarlinKZG10<$bench_pairing_engine, DensePolynomial<$bench_field>>,
             Blake2s,
-        >::universal_setup(65536, 65536, 65536, rng)
+        >::universal_setup(constraints, constraints, constraints, rng)
         .unwrap();
         let (pk, _) = Marlin::<
             $bench_field,
@@ -157,12 +159,12 @@ macro_rules! marlin_verify_bench {
     };
 }
 
-fn bench_prove() {
-    marlin_prove_bench!(bls, BlsFr, Bls12_381);
-    marlin_prove_bench!(mnt4, MNT4Fr, MNT4_298);
-    marlin_prove_bench!(mnt6, MNT6Fr, MNT6_298);
-    marlin_prove_bench!(mnt4big, MNT4BigFr, MNT4_753);
-    marlin_prove_bench!(mnt6big, MNT6BigFr, MNT6_753);
+fn bench_prove(power: u32) {
+    marlin_prove_bench!(bls, BlsFr, Bls12_381, power);
+    //marlin_prove_bench!(mnt4, MNT4Fr, MNT4_298);
+    //marlin_prove_bench!(mnt6, MNT6Fr, MNT6_298);
+    //marlin_prove_bench!(mnt4big, MNT4BigFr, MNT4_753);
+    //marlin_prove_bench!(mnt6big, MNT6BigFr, MNT6_753);
 }
 
 fn bench_verify() {
@@ -174,6 +176,7 @@ fn bench_verify() {
 }
 
 fn main() {
-    bench_prove();
-    bench_verify();
+    let power = &std::env::args().collect::<Vec<_>>()[1];
+    bench_prove(power.parse::<u32>().unwrap());
+    //bench_verify();
 }
